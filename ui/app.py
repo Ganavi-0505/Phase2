@@ -1,0 +1,197 @@
+"""
+ASO dashboard -- run from the project root:   streamlit run ui/app.py
+Pages: results overview, policy comparison, ablation, break-even explorer,
+live what-if scheduler, carbon curves, legacy (v1) pipeline results.
+"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from src.evaluation.world import World
+from src.evaluation.policies import ASOPolicy, Ctx, DELAYS_SEC
+from src.evaluation.sensitivity import expected_nsg, make_pod
+
+BENCH = ROOT / "results" / "benchmark"
+STAY = "Stay (no orchestration)"
+st.set_page_config(page_title="ASO - Carbon-aware orchestration", layout="wide", page_icon="🌱")
+
+
+@st.cache_data
+def load_summary():
+    f = BENCH / "summary.csv"
+    return pd.read_csv(f) if f.exists() else None
+
+
+@st.cache_data
+def load_runs():
+    f = BENCH / "benchmark_runs.csv"
+    return pd.read_csv(f) if f.exists() else None
+
+
+def need_results():
+    st.warning("No benchmark results found. Run:  `python -m src.evaluation.benchmark --csv-path data/borg_traces_data.csv`")
+    st.stop()
+
+
+page = st.sidebar.radio("Page", ["Overview", "Policy comparison", "Ablation & confidence sweep",
+                                 "Break-even explorer", "Live what-if scheduler", "Carbon curves",
+                                 "Legacy pipeline (v1)"])
+st.sidebar.caption("Agentic AI-driven Sustainability Orchestrator (ASO)\n\nResults on a synthetic trace are smoke tests only.")
+
+# ------------------------------------------------------------------ Overview
+if page == "Overview":
+    st.title("🌱 Agentic AI-driven Sustainability Orchestrator")
+    st.markdown("Carbon-aware spatio-temporal workload orchestration with migration-overhead, "
+                "uncertainty (Monte Carlo digital twin) and SLA-risk gating.")
+    s = load_summary()
+    if s is None:
+        need_results()
+    c = st.columns(3)
+    scale = c[0].selectbox("Job-duration scale", sorted(s.scale.unique()), index=len(s.scale.unique()) - 1)
+    slack = c[1].selectbox("Deadline slack", sorted(s.slack.unique()))
+    mode = c[2].selectbox("Migration mode", sorted(s["mode"].unique()))
+    d = s[(s.scale == scale) & (s.slack == slack) & (s["mode"] == mode)].set_index("policy")
+    aso = d.loc["ASO (proposed)"]
+    k = st.columns(4)
+    k[0].metric("Carbon saving vs Stay", f"{aso.carbon_saving_pct:.1f}%", f"95% CI [{aso.ci_lo:.1f}, {aso.ci_hi:.1f}]")
+    k[1].metric("Extra SLA violations", f"{aso.extra_sla_violation_pct:.2f} pp")
+    k[2].metric("Jobs migrated", f"{aso.migration_pct:.1f}%")
+    k[3].metric("Mean delay", f"{aso.mean_delay_min:.1f} min")
+    st.subheader("Same scenario, all policies")
+    show = d[["carbon_saving_pct", "ci_lo", "ci_hi", "extra_sla_violation_pct", "migration_pct", "p_value_vs_stay"]].round(3)
+    st.dataframe(show.sort_values("carbon_saving_pct", ascending=False), width="stretch")
+
+# --------------------------------------------------------- Policy comparison
+elif page == "Policy comparison":
+    st.title("Policy comparison")
+    s = load_summary()
+    if s is None:
+        need_results()
+    mode = st.selectbox("Migration mode", sorted(s["mode"].unique()))
+    s = s[(s["mode"] == mode) & (~s.policy.str.startswith("- ")) & (~s.policy.str.contains("confidence|report gate"))]
+    s = s.assign(scenario=s.apply(lambda r: f"x{r.scale:g} / {r.slack}", axis=1))
+    fig = px.bar(s, x="scenario", y="carbon_saving_pct", color="policy", barmode="group",
+                 error_y=s.ci_hi - s.carbon_saving_pct, error_y_minus=s.carbon_saving_pct - s.ci_lo,
+                 labels={"carbon_saving_pct": "Carbon saving vs Stay (%)"})
+    fig.update_yaxes(range=[-60, 100])
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Axis clipped at -60%: naive greedy policies can be thousands of % WORSE on short jobs because "
+               "migration overhead dominates. See the table below for exact values.")
+    pool = s.groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct", "migration_pct"]].mean().reset_index()
+    fig2 = px.scatter(pool, x="extra_sla_violation_pct", y="carbon_saving_pct", text="policy", size_max=12,
+                      labels={"extra_sla_violation_pct": "Extra SLA violations vs Stay (pp)",
+                              "carbon_saving_pct": "Carbon saving (%, mean over scenarios)"})
+    fig2.update_traces(textposition="top center", marker_size=12)
+    st.plotly_chart(fig2, width="stretch")
+    st.dataframe(s.drop(columns=["scenario"]).round(3), width="stretch")
+
+# ------------------------------------------------------------------ Ablation
+elif page == "Ablation & confidence sweep":
+    st.title("Ablation study and confidence sweep")
+    s = load_summary()
+    if s is None:
+        need_results()
+    a = s[s.policy.str.startswith(("ASO", "- "))]
+    a = a.groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct", "migration_pct"]].mean().reset_index()
+    fig = go.Figure()
+    fig.add_bar(x=a.policy, y=a.carbon_saving_pct, name="Carbon saving (%)")
+    fig.add_bar(x=a.policy, y=a.extra_sla_violation_pct, name="Extra SLA violations (pp)", marker_color="crimson")
+    fig.update_layout(barmode="group", xaxis_tickangle=-30)
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(a.round(3), width="stretch")
+
+# --------------------------------------------------------- Break-even
+elif page == "Break-even explorer":
+    st.title("When is migration worth it?")
+    c = st.columns(3)
+    mem = c[0].slider("Job memory / checkpoint (GB)", 0.5, 32.0, 4.0)
+    kwh = c[1].select_slider("Network energy (kWh/GB)", [0.001, 0.003, 0.01, 0.03, 0.06], value=0.01)
+    mode = c[2].radio("Migration mode", ["live", "new"], horizontal=True)
+    durs = np.logspace(1, 5.3, 60)
+    nsg = [expected_nsg(d, kwh, mode, mem) for d in durs]
+    fig = go.Figure(go.Scatter(x=durs / 60, y=nsg, mode="lines"))
+    fig.add_hline(y=0, line_dash="dash")
+    fig.update_xaxes(type="log", title="Job duration (minutes)")
+    fig.update_yaxes(title="Expected NSG, DC_ASIA -> DC_EU (gCO2)")
+    st.plotly_chart(fig, width="stretch")
+    pos = [d for d, v in zip(durs, nsg) if v > 0]
+    st.info(f"Break-even duration ≈ {min(pos) / 60:.1f} min" if pos else "Migration never pays off in this range.")
+
+# ---------------------------------------------------------- What-if
+elif page == "Live what-if scheduler":
+    st.title("Live what-if scheduler")
+    c = st.columns(4)
+    region = c[0].selectbox("Job currently in", ["DC_ASIA", "DC_US", "DC_EU"])
+    dur_min = c[1].number_input("Predicted runtime (min)", 1.0, 2000.0, 90.0)
+    mem = c[2].number_input("Memory (GB)", 0.5, 64.0, 4.0)
+    hour = c[3].slider("Arrival hour", 0, 23, 2)
+    c = st.columns(4)
+    slack = c[0].slider("Deadline slack (x runtime)", 1.1, 24.0, 3.0)
+    cv = c[1].slider("Runtime uncertainty (relative σ)", 0.05, 1.0, 0.15)
+    sla = c[2].slider("SLA-risk limit", 0.01, 0.9, 0.10)
+    conf = c[3].slider("Required P(NSG>0)", 0.5, 0.99, 0.90)
+    mode = st.radio("Migration mode", ["live", "new"], horizontal=True)
+    w = World(0, migration_mode=mode)
+    node = w.rep_node[region]
+    dur = dur_min * 60
+    pod = make_pod(dur, mem)
+    pod = pod.__class__(**{**pod.__dict__, "source_node": node.node_id, "source_region": region,
+                           "sla_deadline_sec": dur * slack})
+    ctx = Ctx(pod, hour * 3600.0, dur, dur * cv)
+    aso = ASOPolicy(n_mc=400, sla_limit=sla, confidence=conf)
+    rows = []
+    for r in w.regions:
+        dst = node if r == region else w.rep_node[r]
+        for d in DELAYS_SEC:
+            if dst.node_id == node.node_id and d == 0:
+                continue
+            nsg, fin = aso.evaluate(w, ctx, dst, d)
+            p, risk = float(np.mean(nsg > 0)), float(np.mean(fin > pod.sla_deadline_sec))
+            rows.append(dict(target=r, delay_min=d / 60, mean_NSG_g=nsg.mean(), P_NSG_pos=p, SLA_risk=risk,
+                             viable=(p >= conf and risk <= sla)))
+    t = pd.DataFrame(rows)
+    dec = aso.decide(w, ctx)
+    reg = w.node_by_id[dec.node_id].region
+    st.success(f"**Decision:** run in **{reg}**, delay **{dec.delay_sec / 60:.0f} min**  \n{dec.note}")
+    st.dataframe(t.round(3).sort_values("mean_NSG_g", ascending=False), width="stretch")
+    best = t.sort_values("mean_NSG_g", ascending=False).iloc[0]
+    nsg, _ = aso.evaluate(w, ctx, w.rep_node[best.target] if best.target != region else node, best.delay_min * 60)
+    fig = px.histogram(x=nsg, nbins=40, labels={"x": "NSG (gCO2) for best candidate"})
+    fig.add_vline(x=0, line_dash="dash")
+    st.plotly_chart(fig, width="stretch")
+
+# --------------------------------------------------------- Carbon curves
+elif page == "Carbon curves":
+    st.title("Carbon-intensity model")
+    w = World(0)
+    t = np.linspace(0, 86400, 97)
+    fig = go.Figure()
+    for r in w.regions:
+        fig.add_scatter(x=t / 3600, y=w.ci_forecast(r, t), name=f"{r} forecast")
+        fig.add_scatter(x=t / 3600, y=w.ci_truth(r, t), name=f"{r} 'true' (with weather)", line=dict(dash="dot"))
+    fig.update_xaxes(title="Hour of day"); fig.update_yaxes(title="gCO2/kWh")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Synthetic diurnal model. Drop a real hourly CSV into the carbon feed to validate on real grid data.")
+
+# ------------------------------------------------------------- Legacy
+else:
+    st.title("Legacy v1 pipeline outputs")
+    f1, f2 = ROOT / "results" / "hourly_summary.csv", ROOT / "results" / "layer5_candidate_results.csv"
+    if f1.exists():
+        h = pd.read_csv(f1)
+        st.plotly_chart(px.line(h, x="hour", y="mean_nsg_gco2", markers=True), width="stretch")
+        st.dataframe(h, width="stretch")
+    if f2.exists():
+        c = pd.read_csv(f2)
+        st.plotly_chart(px.scatter(c, x="p_nsg_positive", y="sla_risk_score", color="is_statistically_viable",
+                                   hover_data=["pod_id", "target_node_id"]), width="stretch")
+    if not (f1.exists() or f2.exists()):
+        st.info("No v1 result files found in results/.")
