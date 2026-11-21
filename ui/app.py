@@ -18,6 +18,7 @@ import streamlit as st
 from src.evaluation.world import World
 from src.evaluation.policies import ASOPolicy, Ctx, DELAYS_SEC
 from src.evaluation.sensitivity import expected_nsg, make_pod
+from src.layer7_execution import live_events
 
 BENCH = ROOT / "results" / "benchmark"
 STAY = "Stay (no orchestration)"
@@ -42,9 +43,9 @@ def need_results():
 
 
 page = st.sidebar.radio("Page", ["Overview", "Policy comparison", "Ablation & confidence sweep",
-                                 "Break-even explorer", "Live what-if scheduler", "Carbon curves",
-                                 "Legacy pipeline (v1)"])
-st.sidebar.caption("Agentic AI-driven Sustainability Orchestrator (ASO)\n\nResults on a synthetic trace are smoke tests only.")
+                                 "Break-even explorer", "Live what-if scheduler", "Live cluster",
+                                 "Optimizers (GA / PSO / NSGA-II)", "Carbon curves", "Legacy pipeline (v1)"])
+st.sidebar.caption("Agentic AI-driven Sustainability Orchestrator (ASO)\n\nScale x1 = compressed trace durations; x120 / x720 are what-if job-length scenarios. Carbon intensity is simulated.")
 
 # ------------------------------------------------------------------ Overview
 if page == "Overview":
@@ -85,7 +86,8 @@ elif page == "Policy comparison":
     st.plotly_chart(fig, width="stretch")
     st.caption("Axis clipped at -60%: naive greedy policies can be thousands of % WORSE on short jobs because "
                "migration overhead dominates. See the table below for exact values.")
-    pool = s.groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct", "migration_pct"]].mean().reset_index()
+    pool = s[s.scale > 1].groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct", "migration_pct"]].mean().reset_index()
+    st.caption("Trade-off plot excludes scale x1, where naive policies are thousands of % worse and would squash the axis.")
     fig2 = px.scatter(pool, x="extra_sla_violation_pct", y="carbon_saving_pct", text="policy", size_max=12,
                       labels={"extra_sla_violation_pct": "Extra SLA violations vs Stay (pp)",
                               "carbon_saving_pct": "Carbon saving (%, mean over scenarios)"})
@@ -167,6 +169,140 @@ elif page == "Live what-if scheduler":
     fig = px.histogram(x=nsg, nbins=40, labels={"x": "NSG (gCO2) for best candidate"})
     fig.add_vline(x=0, line_dash="dash")
     st.plotly_chart(fig, width="stretch")
+
+# ------------------------------------------------------------- Live cluster
+elif page == "Live cluster":
+    st.title("🔴 Live cluster")
+    c = st.columns([1, 1, 2])
+    refresh = c[0].slider("Refresh every (s)", 1, 10, 2)
+    source = c[1].radio("Cluster view", ["Auto (Kubernetes if reachable)", "Event log only"], horizontal=False)
+    c[2].info("Start a stream in another terminal:\n\n"
+              "`python -m src.layer7_execution.custom_scheduler --engine aso --reset-log` (real Kubernetes / Kind)\n\n"
+              "`python -m src.layer7_execution.live_simulator --jobs 200` (no cluster needed)")
+
+    def render_live(use_k8s):
+        from src.evaluation.world import World
+        from src.layer1_infra.cluster_config import create_default_node_pools
+        evs = live_events.read_events()
+        if not evs:
+            st.warning("No events yet - start the scheduler or the simulator (see above).")
+            return
+        decisions = [e for e in evs if e["kind"] == "decision"]
+        arrived = {e["pod_id"] for e in evs if e["kind"] == "arrive"}
+        bound = {e["pod_id"] for e in evs if e["kind"] == "bind"}
+        done = [e for e in evs if e["kind"] == "complete"]
+        last_dec = {}
+        for e in decisions:
+            last_dec[e["pod_id"]] = e
+        acts = pd.Series([d["action"] for d in last_dec.values()]).value_counts() if last_dec else pd.Series(dtype=int)
+        latest = max((e.get("sim_t", 0) for e in evs if "sim_t" in e), default=0.0)
+        start = next((e for e in evs if e["kind"] == "start"), {})
+        snap = live_events.snapshot_cluster() if use_k8s else None
+
+        k = st.columns(6)
+        k[0].metric("Engine", start.get("engine", "?"))
+        k[1].metric("Simulated clock", f"{int(latest // 3600) % 24:02d}:{int(latest % 3600 // 60):02d}")
+        k[2].metric("Pods seen / bound", f"{len(arrived)} / {len(bound)}")
+        k[3].metric("Pending", len(arrived - bound))
+        k[4].metric("Migrated", int(acts.get("MIGRATE", 0)))
+        k[5].metric("Delayed (to greener hour)", int(acts.get("DELAY", 0)))
+        st.caption("Data source: " + ("real Kubernetes API (kind cluster)" if snap else "event log"))
+
+        # ---- cluster map ----
+        nodes = create_default_node_pools()
+        if snap:
+            on = {}
+            for p in snap["pods"]:
+                if p["node_id"] and p["phase"] in ("Running", "Pending"):
+                    on.setdefault(p["node_id"], []).append(p["pod_id"])
+        else:
+            on = live_events.running_pods(evs)
+        ci = (decisions[-1].get("ci_by_region") if decisions else None) or {}
+        regions = sorted({n.region for n in nodes})
+        cols = st.columns(len(regions))
+        for col, r in zip(cols, regions):
+            with col:
+                val = ci.get(r)
+                st.subheader(r)
+                if val is not None:
+                    st.caption(f"grid intensity now: **{val:.0f} gCO2/kWh**")
+                    st.progress(min(1.0, val / 700.0))
+                for n in [n for n in nodes if n.region == r]:
+                    pods_here = on.get(n.node_id, [])
+                    st.markdown(f"**{n.node_id}** &nbsp; `{len(pods_here)} running` &nbsp; <small>{int(n.mips_rating)} MIPS</small>",
+                                unsafe_allow_html=True)
+                    st.progress(min(1.0, len(pods_here) / 8.0))
+                    if pods_here:
+                        st.caption(", ".join(p[-14:] for p in pods_here[:5]) + (" ..." if len(pods_here) > 5 else ""))
+
+        # ---- carbon tally + action mix ----
+        left, right = st.columns([2, 1])
+        with left:
+            tally = [e for e in done if e.get("carbon_g") is not None]
+            if tally and any("carbon_stay_g" in e for e in tally):
+                t = pd.DataFrame(tally)
+                fig = go.Figure()
+                fig.add_scatter(y=t.carbon_g.cumsum(), name="ASO (chosen)", line=dict(color="#1B7F8C", width=3))
+                fig.add_scatter(y=t.carbon_stay_g.cumsum(), name="Stay (no orchestration)", line=dict(color="#8E9AAF"))
+                if "carbon_greedy_g" in t:
+                    fig.add_scatter(y=t.carbon_greedy_g.cumsum(), name="Greedy lowest-CI", line=dict(color="#E9A23B"))
+                fig.update_layout(title="Cumulative carbon of completed jobs (gCO2)", xaxis_title="completed jobs",
+                                  height=330, margin=dict(t=40, b=10))
+                st.plotly_chart(fig, width="stretch")
+                sav = 100 * (1 - t.carbon_g.sum() / max(t.carbon_stay_g.sum(), 1e-9))
+                viol = int(t.sla_violated.sum()) if "sla_violated" in t else 0
+                st.success(f"ASO so far: **{sav:.1f}% less carbon than Stay** over {len(t)} completed jobs, {viol} SLA violation(s).")
+            elif tally:
+                t = pd.DataFrame(tally)
+                st.metric("Estimated carbon of completed pods (model estimate)", f"{t.carbon_g.sum():.2f} gCO2")
+                st.caption("Real-cluster mode reports Kepler/model-based estimates, not a counterfactual Stay baseline.")
+            else:
+                st.info("Waiting for the first pod to complete ...")
+        with right:
+            if len(acts):
+                fig = go.Figure(go.Pie(labels=list(acts.index), values=list(acts.values), hole=0.5))
+                fig.update_layout(title="Decisions", height=330, margin=dict(t=40, b=10))
+                st.plotly_chart(fig, width="stretch")
+
+        # ---- decision feed ----
+        st.subheader("Decision feed")
+        rows = []
+        for e in decisions[-14:][::-1]:
+            rows.append({"time": pd.to_datetime(e["ts"], unit="s").strftime("%H:%M:%S"), "pod": e["pod_id"][-18:],
+                         "action": {"MIGRATE": "🔀 MIGRATE", "DELAY": "⏳ DELAY", "START": "▶ START"}.get(e["action"], e["action"]),
+                         "from": e.get("source_node"), "to": e.get("target_node"),
+                         "delay (sim min)": round(e.get("delay_s", 0) / 60, 1), "why": e.get("rationale", "")})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.fragment(run_every=refresh)(render_live)(source.startswith("Auto"))
+
+# ------------------------------------------------------------- Optimizers
+elif page == "Optimizers (GA / PSO / NSGA-II)":
+    st.title("Placement optimisers: GA vs PSO vs NSGA-II")
+    f = BENCH / "optimizer_comparison.csv"
+    if not f.exists():
+        st.warning("Run:  `python -m src.layer3_scheduling.ga_optimizer --csv-path data/borg_traces_data.csv`")
+        st.stop()
+    d = pd.read_csv(f)
+    g = d.groupby("method")[["fitness", "carbon_vs_stay_pct", "latency_penalty", "runtime_s", "evaluations"]].mean().reset_index()
+    g = g.sort_values("fitness")
+    c = st.columns(2)
+    c[0].plotly_chart(px.bar(g, x="method", y="fitness", title="Scalar fitness (lower is better)"), width="stretch")
+    c[1].plotly_chart(px.bar(g, x="method", y="carbon_vs_stay_pct", title="Carbon saving vs Stay (%)"), width="stretch")
+    cv = BENCH / "optimizer_convergence.json"
+    if cv.exists():
+        import json
+        hist = json.load(open(cv))
+        fig = go.Figure()
+        for k, v in hist.items():
+            if v:
+                fig.add_scatter(y=v, name=k)
+        fig.update_layout(title="Best fitness per generation / iteration (first batch)", xaxis_title="generation")
+        st.plotly_chart(fig, width="stretch")
+    st.dataframe(g.round(4), width="stretch")
+    st.caption("All methods optimise the same objective with the same evaluation budget. When RAM capacity does not bind, "
+               "placements are almost independent per pod, so a simple per-pod greedy search is already near-optimal; "
+               "GA/NSGA-II earn their keep when capacity constraints interact.")
 
 # --------------------------------------------------------- Carbon curves
 elif page == "Carbon curves":

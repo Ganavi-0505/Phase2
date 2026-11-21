@@ -18,11 +18,17 @@ def _scen(s):
 
 
 def make_all_plots(out: Path):
+    """One set of figures per migration mode (suffix _live / _new)."""
     out = Path(out)
     pdir = out / "plots"
     pdir.mkdir(exist_ok=True)
-    s = pd.read_csv(out / "summary.csv")
-    runs = pd.read_csv(out / "benchmark_runs.csv")
+    s_all = pd.read_csv(out / "summary.csv")
+    runs_all = pd.read_csv(out / "benchmark_runs.csv")
+    for mode in s_all["mode"].unique():
+        _plots_for_mode(s_all[s_all["mode"] == mode].copy(), runs_all[runs_all["mode"] == mode], pdir, mode)
+
+
+def _plots_for_mode(s, runs, pdir, sfx):
     s["scen"] = s.apply(_scen, axis=1)
     scens = list(dict.fromkeys(s.scen))
 
@@ -38,19 +44,20 @@ def make_all_plots(out: Path):
     ax.set_xticks(np.arange(len(scens)) + 0.4 - w / 2); ax.set_xticklabels(scens)
     ax.set_ylabel("Carbon saving vs Stay (%)"); ax.legend(fontsize=7, ncol=2)
     ax.set_title("Net carbon saving (execution + migration), bootstrap 95% CI\n(x = job-duration scale; tight/mixed = deadline slack)")
-    fig.tight_layout(); fig.savefig(pdir / "policy_carbon_saving.png", dpi=160); plt.close(fig)
+    fig.tight_layout(); fig.savefig(pdir / f"policy_carbon_saving_{sfx}.png", dpi=160); plt.close(fig)
 
     # 2. Pareto: carbon saving vs extra SLA violations (pooled over scenarios)
     fig, ax = plt.subplots(figsize=(7, 5))
-    pool = s.groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct"]].mean()
+    pool = s[s.scale > 1].groupby("policy")[["carbon_saving_pct", "extra_sla_violation_pct"]].mean()
+    pool = pool[pool.index.isin(BASE + ABL)]
     for p, r in pool.iterrows():
         ax.scatter(r.extra_sla_violation_pct, r.carbon_saving_pct, s=80 if p == ASO_MAIN else 40,
                    marker="*" if p == ASO_MAIN else "o", zorder=3)
         ax.annotate(p[:28], (r.extra_sla_violation_pct, r.carbon_saving_pct), fontsize=6, xytext=(3, 3),
                     textcoords="offset points")
     ax.set_xlabel("Extra SLA violations vs Stay (percentage points)"); ax.set_ylabel("Carbon saving vs Stay (%)")
-    ax.set_title("Carbon / SLA trade-off (top-left is best)"); ax.grid(alpha=.3)
-    fig.tight_layout(); fig.savefig(pdir / "pareto_carbon_vs_sla.png", dpi=160); plt.close(fig)
+    ax.set_title("Carbon / SLA trade-off, job scales > 1 (top-left is best)"); ax.grid(alpha=.3)
+    fig.tight_layout(); fig.savefig(pdir / f"pareto_carbon_vs_sla_{sfx}.png", dpi=160); plt.close(fig)
 
     # 3. Ablation
     fig, ax = plt.subplots(figsize=(9, 4.5))
@@ -60,7 +67,7 @@ def make_all_plots(out: Path):
     ax.bar(x + .2, a.extra_sla_violation_pct, .4, label="Extra SLA violations (pp)", color="tab:red")
     ax.set_xticks(x); ax.set_xticklabels([n.replace("- ", "-\n") for n in a.index], fontsize=6.5)
     ax.axhline(0, color="k", lw=.8); ax.legend(); ax.set_title("Ablation: contribution of each component (mean over scenarios)")
-    fig.tight_layout(); fig.savefig(pdir / "ablation.png", dpi=160); plt.close(fig)
+    fig.tight_layout(); fig.savefig(pdir / f"ablation_{sfx}.png", dpi=160); plt.close(fig)
 
     # 4. Saving by arrival hour for ASO at the largest scale
     big = runs[runs.scale == runs.scale.max()]
@@ -72,4 +79,4 @@ def make_all_plots(out: Path):
     ax.bar(h.index, 100 * (1 - h.aso / h.stay), width=1.6)
     ax.set_xlabel("Job arrival hour"); ax.set_ylabel("ASO saving vs Stay (%)")
     ax.set_title(f"Time-of-day effect (duration scale x{runs.scale.max():g})"); ax.grid(alpha=.3)
-    fig.tight_layout(); fig.savefig(pdir / "saving_by_hour.png", dpi=160); plt.close(fig)
+    fig.tight_layout(); fig.savefig(pdir / f"saving_by_hour_{sfx}.png", dpi=160); plt.close(fig)

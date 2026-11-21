@@ -130,7 +130,7 @@ class ASOPolicy(Policy):
         dur_stay = ctx.pred_mean * np.exp(cv * z)                     # shared latent runtime (CRN)
         dur_dst = dur_stay * world.speed_ratio(src, dst) * np.exp(
             (world.hw_sigma if self.use_unc else 0.0) * (rng.normal(size=n) if self.use_unc else 0.0))
-        mig_t, mig_c, _ = world.migration(pod, src, dst, ctx.t_arrive + delay)
+        mig_t, mig_c, _ = world.migration(pod, src, dst, ctx.t_arrive + delay, truth=False)  # planner uses forecast only
         if not self.use_mig:
             mig_t, mig_c = 0.0, 0.0
         s = world.ci_sigma if self.use_unc else 0.0

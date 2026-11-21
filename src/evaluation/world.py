@@ -155,8 +155,11 @@ class World:
     def speed_ratio(self, src: NodeConfig, dst: NodeConfig) -> float:
         return src.mips_rating / dst.mips_rating
 
-    def migration(self, pod: WorkloadPod, src: NodeConfig, dst: NodeConfig, t: float):
-        """Returns (duration_sec, carbon_g, energy_kwh). Zero for same node."""
+    def migration(self, pod: WorkloadPod, src: NodeConfig, dst: NodeConfig, t: float, truth: bool = True):
+        """Returns (duration_sec, carbon_g, energy_kwh). Zero for same node.
+
+        truth=True  -> carbon priced with the hidden TRUE grid intensity (used when REALISING outcomes)
+        truth=False -> priced with the planner's FORECAST (used when PLANNING; avoids leaking the truth)"""
         if src.node_id == dst.node_id:
             return 0.0, 0.0, 0.0
         est = self.clark.estimate_migration_cost(pod, src, dst, 0.0,
@@ -164,7 +167,8 @@ class World:
         mem = max(0.05, pod.assigned_memory_gb)
         payload = mem * 1.3 if self.migration_mode == "live" else max(0.01, 0.05 * mem)
         kwh = payload * self.net_kwh_per_gb
-        ci = 0.5 * (float(self.ci_truth(src.region, t)[0]) + float(self.ci_truth(dst.region, t)[0]))
+        fn = self.ci_truth if truth else self.ci_forecast
+        ci = 0.5 * (float(fn(src.region, t)[0]) + float(fn(dst.region, t)[0]))
         return est.migration_duration_sec, kwh * ci, kwh
 
     # ---- ground-truth realisation ------------------------------------------

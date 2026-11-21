@@ -79,14 +79,31 @@ class RuntimeModelV2:
         base_rmse = float(np.sqrt(mean_squared_error(y, np.full_like(y, base))))
         lo, hi = p_log - 1.645 * self.sigma_log, p_log + 1.645 * self.sigma_log
         self.residual_std = float(np.std(y - yhat))
+        # Calculate RMSE improvement safely
+        if base_rmse > 1e-12:
+            rmse_improvement = (1 - rmse / base_rmse) * 100
+        else:
+            rmse_improvement = None
+
         self.metrics = {
-            "train_samples": float(len(both)), "test_samples": float(len(test)),
-            "mae": mae, "rmse": rmse, "r2": float(r2_score(y, yhat)),
+            "train_samples": float(len(both)),
+            "test_samples": float(len(test)),
+            "mae": mae,
+            "rmse": rmse,
+            "r2": float(r2_score(y, yhat)),
             "r2_log": float(r2_score(y_log, p_log)),
-            "smape_percent": float(np.mean(2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat))) * 100),
-            "baseline_rmse": base_rmse, "rmse_improvement_percent": (1 - rmse / base_rmse) * 100,
+            "smape_percent": float(
+                np.mean(
+                    2 * np.abs(y - yhat) /
+                    (np.abs(y) + np.abs(yhat))
+                ) * 100
+            ),
+            "baseline_rmse": base_rmse,
+            "rmse_improvement_percent": rmse_improvement,
             "sigma_log": self.sigma_log,
-            "interval_coverage_pct": float(np.mean((y_log >= lo) & (y_log <= hi)) * 100),
+            "interval_coverage_pct": float(
+                np.mean((y_log >= lo) & (y_log <= hi)) * 100
+            ),
             "target_coverage_pct": self.coverage * 100,
             "residual_std": self.residual_std,
         }
